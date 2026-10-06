@@ -141,3 +141,9 @@ RemoteSystemsTempFiles/
 .settings/
 .launches/
 /.metadata/
+
+.codex/
+AGENTS.md
+sw/src/.codex/
+sw/src/.theia/
+sw/src/AGENTS.md

@@ -40,9 +40,15 @@ void (*PeriodicTask)(void);   // user function to be called periodically
 //            Minimum is determined by length of ISR
 // Output: none
 void SysTick_InitArm(void(*task)(void), uint32_t period, uint32_t priority){
-     // ****ECE445L write this ****
-  
+  // ****ECE445L write this ****
+  SysTick->CTRL = 0x00;      // disable SysTick during setup
+  PeriodicTask = task; 
+  SysTick->LOAD = period-1;  // reload value
+  SCB->SHP[1] = (SCB->SHP[1]&(~0xC0000000))|(priority<<30); // priority 2
+  SysTick->VAL = 0;          // any write to VAL clears COUNT and sets VAL equal to LOAD
+  SysTick->CTRL = 0x07;      // enable SysTick with 80 MHz bus clock and interrupts
 }
+
 int main0(void){ // main0 is used to test the DAC interface
   uint32_t n=0;
   __disable_irq(); 
@@ -98,16 +104,65 @@ int main1(void){ // main1 output sine wave to DAC
     __WFI();
   }
 }
+
+
+
+//--------------------------------------------BUTTON TEST--------------------------------
+#include "../lib/DurationTimer.h"
+volatile uint32_t PlayRaw = 0;
+volatile uint32_t RewindRaw = 0;
+volatile uint32_t SpeedRaw = 0;
+volatile uint32_t PlayEvents = 0;
+volatile uint32_t RewindEvents = 0;
+volatile uint32_t SpeedEvents = 0;
+
+static void ButtonTest_Tick(void){
+  PlayRaw = Switch_Play();
+  RewindRaw = Switch_Rewind();
+  SpeedRaw = Switch_Voice();
+
+  if(Get_Button_Press(BUTTON_PLAY)){
+    PlayEvents++;
+  }
+
+  if(Get_Button_Press(BUTTON_REWIND)){
+    RewindEvents++;
+  }
+
+  if(Get_Button_Press(BUTTON_SPEED)){
+    SpeedEvents++;
+  }
+}
+
+int main2(void){
+  __disable_irq();
+
+  LaunchPad_Init();
+  Clock_Init_HFXT_40_80MHz(0);
+  Switch_Init();
+
+  DurationTimer_Init(&ButtonTest_Tick);
+
+  __enable_irq();
+
+  while(1){
+    __WFI();
+  }
+}
 int main(void){ 
   __disable_irq(); 
    // ****ECE445L write this ****
+  // LaunchPad_Init();
+  // Clock_Init_HFXT_40_80MHz(0);
   
+  //comment out for button test
+  //Song_Init(); //Initializes SPI, switches, and 1 ms timer
 
  __enable_irq();
 
   while(1){
   // ****ECE445L write this ****
-
+  return main2(); //button test
 
   } 
 } 
@@ -118,8 +173,7 @@ int main(void){
 
 void SysTick_Handler(void){
 // ****ECE445L write this ****
-
-
+  PeriodicTask();
 }
 
 

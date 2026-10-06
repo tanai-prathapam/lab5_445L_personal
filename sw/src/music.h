@@ -5,6 +5,23 @@
 // EE445L Fall 2026
 //    Jonathan W. Valvano 6/29/26
 
+#include <stdint.h>
+
+typedef struct {
+  uint32_t period;       // SysTick clock cycles per sample; 0 = rest.
+  uint32_t duration_ms;  // How long this note or rest lasts.
+} Note_t;
+
+typedef struct {
+  const Note_t *notes;   // Address of the song's note array.
+  uint32_t length;      // Number of entries in that array.
+} Song_t;
+
+typedef struct {
+  const uint16_t *samples;  // Points to one cycle of waveform data.
+  uint32_t length;         // Number of samples in that cycle.
+} Instrument_t;
+
 //-------------- Song_Init ----------------
 // activate SysTick, Timer0 and Timer1 periodic interrupts,
 // and DAC
@@ -12,3 +29,8 @@
 // Outputs: none
 // called once
 void Song_Init(void);
+
+void Play(const Song_t *song);
+void Pause(void);
+void Rewind(void);
+void ToggleSpeed(void);

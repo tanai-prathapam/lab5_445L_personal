@@ -5,6 +5,8 @@
 //    Jonathan W. Valvano 6/29/26
 // 2-bit input, positive logic switches, positive logic software
 
+#include <stdint.h>
+
     // write this
     // ***solution***
 // PA28 Voice switch 
@@ -31,3 +33,15 @@ int Switch_Play(void);
 // Output: false the Voice switch not pressed
 //         true the Voice switch is pressed 
 int Switch_Voice(void);
+
+int Switch_Rewind(void);
+
+typedef enum {
+  BUTTON_PLAY,
+  BUTTON_REWIND,
+  BUTTON_SPEED,
+  BUTTON_COUNT
+} Button_t;
+
+uint32_t Get_Button_Press(Button_t button);
+
