@@ -89,11 +89,11 @@ int main1(void){ // main1 output sine wave to DAC
   LaunchPad_Init();
   Clock_Init_HFXT_40_80MHz(0);  // 0.005% accurate running off external crystal oscillator
 
-  ST7735_InitR(INITR_REDTAB); //INITR_REDTAB for AdaFruit, INITR_BLACKTAB for SPI HiLetgo ST7735R
-  ST7735_FillScreen(ST7735_BLACK);
-  ST7735_SetCursor(0, 0);  
-  ST7735_OutString("ECE445L main1\n");
-  ST7735_OutString("Sine wave out to DAC\n");
+  // ST7735_InitR(INITR_REDTAB); //INITR_REDTAB for AdaFruit, INITR_BLACKTAB for SPI HiLetgo ST7735R
+  // ST7735_FillScreen(ST7735_BLACK);
+  // ST7735_SetCursor(0, 0);  
+  // ST7735_OutString("ECE445L main1\n");
+  // ST7735_OutString("Sine wave out to DAC\n");
   TIMG0->COUNTERREGS.CTRCTL &= ~0x01; // disarm G0 if not using SDC
   MCP4921_Init(2048);
   Index64 = 0;
@@ -151,19 +151,19 @@ int main2(void){
 }
 int main(void){ 
   __disable_irq(); 
-   // ****ECE445L write this ****
-  // LaunchPad_Init();
-  // Clock_Init_HFXT_40_80MHz(0);
-  
+
   //comment out for button test
-  //Song_Init(); //Initializes SPI, switches, and 1 ms timer
+  LaunchPad_Init();
+  Clock_Init_HFXT_40_80MHz(0);
+  Song_Init(); //Initializes SPI, switches, and 1 ms timer
 
  __enable_irq();
 
   while(1){
-  // ****ECE445L write this ****
-  return main2(); //button test
-
+    //return main2(); //button test
+    // return main0();
+    // return main1();
+    __WFI();
   } 
 } 
 

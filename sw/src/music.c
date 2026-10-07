@@ -25,9 +25,9 @@ void SysTick_InitArm(void (*task)(void), uint32_t period, uint32_t priority);
 
 //Song Definition
 static const Note_t TestNotes[] = {
-  {NOTE_A4, 500}, //Format: {period, duration in ms}
-  {REST,   250},
-  {NOTE_C5, 500}
+  {NOTE_A4, 3000}, //Format: {period, duration in ms}
+  {REST,   2000},
+  {NOTE_C5, 3000}
 };
 
 static const Song_t TestSong = {
@@ -46,6 +46,11 @@ static const uint16_t SineWave[64] = {
   48,58,86,134,200,284,385,502,
   634,779,937,1105,1283,1467,1658,1852
 };
+
+
+static const uint16_t balls[//putlengthhere] = {
+  //copy paste here
+}
 
 static const Instrument_t SineInstrument = {
   SineWave,
