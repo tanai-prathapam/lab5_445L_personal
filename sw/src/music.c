@@ -40,17 +40,17 @@ void SysTick_InitArm(void (*task)(void), uint32_t period, uint32_t priority);
 #define HALF     1000U
 #define DOTHALF  1500U
 
-// Silence imposed at the tail of every note so that two of the same pitch
-// back to back (bars 2, 4, 10, 12) are heard as two notes instead of one
-// long one. Taken out of the note duration rather than added to it, so
-// the tempo is unaffected.
-#define ARTICULATION_MS 30U
+// Envelope times are musical milliseconds: 2x tempo shortens both fades
+// These times do not depend on the pitch or waveform interrupt frequency
+#define ENVELOPE_ATTACK_MS  40U
+#define ENVELOPE_RELEASE_MS 80U
+#define GAIN_FULL          256U
+#define DAC_MIDPOINT      2048
 
 // Song Definition
-// Minuet in G major, BWV Anh. 114, a
-// This is the right-hand melody of the 16-bar first section, which the
-// score marks with a repeat, so the section is listed twice below.
-// 9 distinct pitches, 48 seconds at the written tempo.
+// Minuet in G major
+// Melody repeated twice
+// 9 distinct pitches, 48 seconds 
 #define MINUET_SECTION_A                                                   \
   /* bar  1 */ {NOTE_D5, QUARTER}, {NOTE_G4, EIGHTH}, {NOTE_A4, EIGHTH},   \
                {NOTE_B4, EIGHTH}, {NOTE_C5, EIGHTH},                       \
@@ -107,197 +107,265 @@ static const Instrument_t SineInstrument = {
   sizeof(SineWave) / sizeof(SineWave[0])
 };
 
-//State Variables
-typedef enum {
-  STOPPED,
-  PLAYING,
-  PAUSED
-} PlaybackState_t;
+// Each voice owns its score position, waveform position and envelope.
+typedef struct {
+  uint32_t attack_ms;
+  uint32_t release_ms;
+} Envelope_t;
 
+typedef struct {
+  const Song_t *score;
+  const Instrument_t *instrument;
+  const Envelope_t *envelope;
+  void (*arm)(uint32_t period);
+  void (*stop)(void);
+  uint32_t noteIndex;
+  uint32_t waveIndex;
+  uint32_t remainingMs;
+  uint32_t elapsedMs;
+  uint32_t attackMs;
+  uint32_t releaseMs;
+  uint32_t gain;             // 0 = silence, 256 = full amplitude.
+  int32_t latestSample;      // Waveform sample centered around zero.
+  uint32_t sounding;         // False during rests and after the score ends.
+} Voice_t;
+
+typedef enum { STOPPED, PLAYING, PAUSED } PlaybackState_t;
+
+static const Envelope_t DefaultEnvelope = {
+  ENVELOPE_ATTACK_MS, ENVELOPE_RELEASE_MS
+};
+
+// Smoothstep curve, 3*x*x - 2*x*x*x, sampled from x=0 to x=1.
+// Integer lookup gives gentle starts/ends without floating point in an ISR.
+static const uint16_t EnvelopeCurve[33] = {
+  0,1,3,6,11,17,24,31,40,49,59,70,81,92,104,116,128,
+  140,152,164,175,186,197,207,216,225,232,239,245,250,253,255,256
+};
+
+static void Music_OutputSample(void);
+static void Music_ArmMelody(uint32_t period){
+  SysTick_InitArm(&Music_OutputSample, period, 0);
+}
+static void Music_StopMelody(void){
+  SysTick->CTRL = 0;
+}
+
+static volatile Voice_t Melody = {
+  .score = &MinuetSong,
+  .instrument = &SineInstrument,
+  .envelope = &DefaultEnvelope,
+  .arm = Music_ArmMelody,
+  .stop = Music_StopMelody
+};
 static volatile uint32_t PlaybackSpeed = 1;
-static volatile PlaybackState_t PlaybackState = STOPPED; //start with STOPPED state
+static volatile PlaybackState_t PlaybackState = STOPPED;
+// Song_Init uses this selection too; change the default song here.
 static const Song_t *CurrentSong = &MinuetSong;
-static volatile uint32_t NoteIndex = 0;
-static volatile uint32_t WaveIndex = 0;
-static volatile uint32_t RemainingMs = 0;
 
-//Sets one sample value for the DAC
+// Called by the 1 ms score clock (independent from pitch)
+//choose current gain
+static void Music_UpdateEnvelope(volatile Voice_t *voice){
+  uint32_t gain = GAIN_FULL;
+  if(!voice->sounding || voice->remainingMs == 0){
+    gain = 0;
+  }
+  else if(voice->attackMs != 0 && voice->elapsedMs < voice->attackMs){
+    uint32_t index = (voice->elapsedMs * 32U) / voice->attackMs;
+    gain = EnvelopeCurve[index];
+  }
+  else if(voice->releaseMs != 0 && voice->remainingMs <= voice->releaseMs){
+    uint32_t index = (voice->remainingMs * 32U) / voice->releaseMs;
+    gain = EnvelopeCurve[index];
+  }
+  voice->gain = gain;
+}
+
+// SCALE -  gain=0 always means the DAC midpoint.
+static int32_t Music_VoiceContribution(const volatile Voice_t *voice){
+  return (voice->latestSample * (int32_t)voice->gain) / (int32_t)GAIN_FULL;
+}
+
+// All waveform callbacks use this output point. When harmony is added,
+// add its contribution and divide the sum by two to reserve DAC headroom.\
+//ADD MIDPOINT BACK
+static void Music_OutputMix(void){
+  int32_t sample = DAC_MIDPOINT;
+  if(PlaybackState == PLAYING){
+    sample += Music_VoiceContribution(&Melody);
+  }
+  // Defensive bounds also protect the DAC configuration bits.
+  if(sample < 0){ sample = 0; }
+  else if(sample > 4095){ sample = 4095; }
+  MCP4921_OutNonBlocking((uint32_t)sample);
+}
+
+//UNCENTER - sine sample
+static void Music_StepVoiceSample(volatile Voice_t *voice){
+  if(!voice->sounding){ return; }
+  voice->latestSample =
+      (int32_t)voice->instrument->samples[voice->waveIndex] - DAC_MIDPOINT;
+  voice->waveIndex++;
+  if(voice->waveIndex >= voice->instrument->length){
+    voice->waveIndex = 0;
+  }
+}
+
 static void Music_OutputSample(void){
-  if(PlaybackState != PLAYING){
-    return; //hold same voltage value (do not advance through wave or notes)
-  }
-
-  // A period of zero marks a rest.
-  if(CurrentSong->notes[NoteIndex].period == REST){
-    return; //hold same voltage value (do not advance through wave or notes)
-  }
-
-  MCP4921_OutNonBlocking( SineInstrument.samples[WaveIndex]); //set sample value
-  WaveIndex++;
-
-  //wrap around to repeat wave
-  if(WaveIndex >= SineInstrument.length){
-    WaveIndex = 0;
-  }
+  if(PlaybackState != PLAYING){ return; }
+  Music_StepVoiceSample(&Melody);
+  Music_OutputMix();
 }
 
-// Stop driving the speaker without leaving the current note. Used both to
-// pause and to cut the articulation gap at the end of each note.
+// Preserve position and envelope for pause. Rewind resets them separately.
 static void Music_Silence(void){
-  SysTick->CTRL = 0;   //prevent waveform generation
-  MCP4921_OutNonBlocking(2048);
+  Melody.stop();
+  MCP4921_OutNonBlocking(DAC_MIDPOINT);
 }
 
-static void Music_LoadNote(void){
+static void Music_ResetVoice(volatile Voice_t *voice, const Song_t *score){
+  voice->stop();
+  voice->score = score;
+  voice->noteIndex = 0;
+  voice->waveIndex = 0;
+  voice->remainingMs = 0;
+  voice->elapsedMs = 0;
+  voice->attackMs = 0;
+  voice->releaseMs = 0;
+  voice->gain = 0;
+  voice->latestSample = 0;
+  voice->sounding = 0;
+}
+
+static void Music_LoadVoiceNote(volatile Voice_t *voice){
   uint32_t previousMask = __get_PRIMASK();
   __disable_irq();
+  voice->stop();
+  voice->waveIndex = 0;
+  voice->elapsedMs = 0;
+  voice->remainingMs = 0;
+  voice->latestSample = 0;
+  voice->gain = 0;
+  voice->sounding = 0;
 
-  // Stop waveform interrupts while changing notes.
-  Music_Silence();
-  WaveIndex = 0;
+  if(voice->noteIndex < voice->score->length){
+    const Note_t *note = &voice->score->notes[voice->noteIndex];
+    voice->remainingMs = note->duration_ms;
+    voice->sounding = (note->period != REST && note->duration_ms != 0);
 
-  if(NoteIndex >= CurrentSong->length){ //end of song
-    PlaybackState = STOPPED;
-    RemainingMs = 0;
-  }
-  else {
-    const Note_t *note = &CurrentSong->notes[NoteIndex];
-    RemainingMs = note->duration_ms;
-    if(note->period != REST){
-      SysTick_InitArm(&Music_OutputSample, note->period, 0);
+    //set original range
+    // Short notes still have non-overlapping attack and release windows.
+    voice->attackMs = voice->envelope->attack_ms;
+    if(voice->attackMs > note->duration_ms / 2U){
+      voice->attackMs = note->duration_ms / 2U;
     }
+    voice->releaseMs = voice->envelope->release_ms;
+    if(voice->releaseMs > note->duration_ms - voice->attackMs){
+      voice->releaseMs = note->duration_ms - voice->attackMs;
+    }
+    Music_UpdateEnvelope(voice);
+    if(voice->sounding){ voice->arm(note->period); }
   }
-
+  // Clearing one voice must not silence the other when harmony is added.
+  Music_OutputMix();
   __set_PRIMASK(previousMask);
+}
+
+static void Music_TickVoice(volatile Voice_t *voice){
+  if(voice->noteIndex >= voice->score->length){ return; }
+  uint32_t step = PlaybackSpeed;
+  if(voice->remainingMs <= step){
+    voice->gain = 0;
+    voice->remainingMs = 0;
+    voice->noteIndex++;
+    Music_LoadVoiceNote(voice);
+  }
+  else{
+    voice->remainingMs -= step;
+    voice->elapsedMs += step;
+    Music_UpdateEnvelope(voice);
+  }
 }
 
 static void Music_CheckButtons(void){
   uint32_t play = Get_Button_Press(BUTTON_PLAY);
   uint32_t rewind = Get_Button_Press(BUTTON_REWIND);
   uint32_t speed = Get_Button_Press(BUTTON_SPEED);
-
-  if(rewind){
-    Rewind();
-  }
+  if(rewind){ Rewind(); }
   else if(play){
-    //one button toggles between playing and paused
-    if(PlaybackState == PLAYING){
-      Pause();
-    }
-    else{
-      Play(CurrentSong);
-    }
+    if(PlaybackState == PLAYING){ Pause(); }
+    else{ Play(CurrentSong); }
   }
-
-  if(speed){
-    ToggleSpeed();
-  }
+  if(speed){ ToggleSpeed(); }
 }
 
 static void Music_Tick1ms(void){
   Music_CheckButtons();
-
-  uint32_t previousMask = __get_PRIMASK();
-  __disable_irq();
-
-  if(PlaybackState == PLAYING && RemainingMs > 0){
-    if(RemainingMs <= PlaybackSpeed){ //prevent overflow
-      RemainingMs = 0;
-      NoteIndex++;
-      Music_LoadNote();
-    }else{
-      RemainingMs -= PlaybackSpeed; //subtract either 1 or 2 to move through the note at normal speed or 2x the speed
-
-      //release the note early so a repeated pitch is heard as two notes
-      if(RemainingMs <= ARTICULATION_MS){
-        Music_Silence();
-      }
-    }
+  if(PlaybackState != PLAYING){ return; }
+  // Waveform interrupts may preempt envelope calculations. They read only
+  // the published gain and sample, not the in-progress note bookkeeping.
+  Music_TickVoice(&Melody);
+  // Add Music_TickVoice(&Harmony) here later; stop after BOTH scores finish.
+  if(Melody.noteIndex >= Melody.score->length){
+    PlaybackState = STOPPED;
+    Music_Silence();
   }
-
-  __set_PRIMASK(previousMask);
 }
 
 void Song_Init(void){
   uint32_t previousMask = __get_PRIMASK();
   __disable_irq();
-
-  SysTick->CTRL = 0; //prevent waveform gen
-
   PlaybackState = STOPPED;
   PlaybackSpeed = 1;
-  CurrentSong = &MinuetSong;
-  NoteIndex = 0;
-  WaveIndex = 0;
-  RemainingMs = 0;
-
+  Music_ResetVoice(&Melody, CurrentSong);
   Switch_Init();
-  MCP4921_Init(2048); //SPI init
-  MCP4921_Out(2048); //Start at midpoint voltage
-  DurationTimer_Init(&Music_Tick1ms); //1ms timer
-
+  MCP4921_Init(DAC_MIDPOINT);
+  MCP4921_Out(DAC_MIDPOINT);
+  DurationTimer_Init(&Music_Tick1ms);
   __set_PRIMASK(previousMask);
 }
 
 void Pause(void){
   uint32_t previousMask = __get_PRIMASK();
   __disable_irq();
-
   if(PlaybackState == PLAYING){
     PlaybackState = PAUSED;
     Music_Silence();
   }
-
   __set_PRIMASK(previousMask);
 }
 
 void Play(const Song_t *song){
-  if(song == 0 || song->notes == 0 || song->length == 0){
-    return;
-  }
-
+  if(song == 0 || song->notes == 0 || song->length == 0){ return; }
   uint32_t previousMask = __get_PRIMASK();
   __disable_irq();
-
-  //If first time playing song or after a rewind
   if(PlaybackState == STOPPED || CurrentSong != song){
-    SysTick->CTRL = 0;
     CurrentSong = song;
-    NoteIndex = 0;
+    Music_ResetVoice(&Melody, song);
     PlaybackState = PLAYING;
-    Music_LoadNote();
+    Music_LoadVoiceNote(&Melody);
   }
-
-  //Resume at same position (do not load a new note); wave index should stay the same, note index should stay the same
-  else if(PlaybackState == PAUSED) {
+  else if(PlaybackState == PAUSED){
     PlaybackState = PLAYING;
-    uint32_t period = CurrentSong->notes[NoteIndex].period;
-    //stay silent if the pause landed inside the note's release gap
-    if(period != REST && RemainingMs > ARTICULATION_MS){
-      SysTick_InitArm(&Music_OutputSample, period, 0);
+    if(Melody.sounding){
+      Melody.arm(Melody.score->notes[Melody.noteIndex].period);
     }
   }
-
   __set_PRIMASK(previousMask);
 }
 
-void Rewind (void) {
+void Rewind(void){
   uint32_t previousMask = __get_PRIMASK();
   __disable_irq();
-
   PlaybackState = STOPPED;
+  Music_ResetVoice(&Melody, CurrentSong);
   Music_Silence();
-
-  NoteIndex = 0;
-  WaveIndex = 0;
-  RemainingMs = 0;
-
   __set_PRIMASK(previousMask);
 }
 
 void ToggleSpeed(void){
   uint32_t previousMask = __get_PRIMASK();
   __disable_irq();
-  PlaybackSpeed = (PlaybackSpeed == 1) ? 2 : 1; //toggle
+  PlaybackSpeed = (PlaybackSpeed == 1) ? 2 : 1;
   __set_PRIMASK(previousMask);
 }

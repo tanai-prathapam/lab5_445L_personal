@@ -5,6 +5,9 @@
 // EE445L Fall 2026
 //    Jonathan W. Valvano 6/29/26
 
+#ifndef MUSIC_H
+#define MUSIC_H
+
 #include <stdint.h>
 
 typedef struct {
@@ -23,8 +26,8 @@ typedef struct {
 } Instrument_t;
 
 //-------------- Song_Init ----------------
-// activate SysTick, Timer0 and Timer1 periodic interrupts,
-// and DAC
+// Initialize the melody voice, DAC, switches and TimerG8 score clock.
+// SysTick starts when Play() loads a pitched note.
 // Inputs: none
 // Outputs: none
 // called once
@@ -34,3 +37,5 @@ void Play(const Song_t *song);
 void Pause(void);
 void Rewind(void);
 void ToggleSpeed(void);
+
+#endif // MUSIC_H
