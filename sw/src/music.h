@@ -15,9 +15,10 @@ typedef struct {
   uint32_t duration_ms;  // How long this note or rest lasts.
 } Note_t;
 
-typedef struct {
-  const Note_t *notes;   // Address of the song's note array.
+typedef struct Song {
+  const Note_t *notes;   // Address of this voice's note array.
   uint32_t length;      // Number of entries in that array.
+  const struct Song *harmony; // Optional bass score; 0 for melody only.
 } Song_t;
 
 typedef struct {
@@ -26,16 +27,21 @@ typedef struct {
 } Instrument_t;
 
 //-------------- Song_Init ----------------
-// Initialize the melody voice, DAC, switches and TimerG8 score clock.
-// SysTick starts when Play() loads a pitched note.
+// Initialize both voices, DAC, switches, TimerA1 and TimerG8 score clock.
+// Play starts SysTick (melody) and TimerA1 (harmony) for pitched notes.
 // Inputs: none
 // Outputs: none
 // called once
 void Song_Init(void);
 
+// Play a melody and its optional harmony; both share transport and tempo.
 void Play(const Song_t *song);
 void Pause(void);
 void Rewind(void);
 void ToggleSpeed(void);
+
+// Nonzero means the SPI transmit FIFO was full when an audio write was due.
+// Inspect in the CCS watch window; reset by Song_Init().
+extern volatile uint32_t Music_DACDroppedSamples;
 
 #endif // MUSIC_H
