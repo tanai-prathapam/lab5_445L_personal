@@ -61,6 +61,10 @@ void SysTick_InitArm(void (*task)(void), uint32_t period, uint32_t priority);
 #define MUSIC_ENABLE_HARMONY 1
 // 256 = current level. Try 128 to check amplifier/speaker headroom.
 #define MUSIC_OUTPUT_GAIN 256U
+// Temporary listening test: 1 selects four isolated tones; 0 restores Minuet.
+// The test uses the normal voice/envelope/mixer code at quarter volume.
+#define MUSIC_DIAGNOSTIC_MODE 0
+#define MUSIC_DIAGNOSTIC_GAIN 64U
 
 // Song Definition
 // Minuet in G major
@@ -138,6 +142,32 @@ static const Song_t MinuetSong = {
   MinuetNotes,
   sizeof(MinuetNotes) / sizeof(MinuetNotes[0]),
   MUSIC_ENABLE_HARMONY ? &MinuetHarmony : 0
+};
+
+// Four 4-second tones, each followed by 1 second of silence:
+// 1 melody G4, 2 harmony G4, 3 both G4, 4 melody G4 + harmony G3.
+// Keep the harmony attached in every stage for consistent mixer scaling.
+static const Note_t DiagnosticMelodyNotes[] = {
+  {NOTE_G4, 4000U}, {REST, 1000U},
+  {REST,    4000U}, {REST, 1000U},
+  {NOTE_G4, 4000U}, {REST, 1000U},
+  {NOTE_G4, 4000U}, {REST, 1000U}
+};
+static const Note_t DiagnosticHarmonyNotes[] = {
+  {REST,    4000U}, {REST, 1000U},
+  {NOTE_G4, 4000U}, {REST, 1000U},
+  {NOTE_G4, 4000U}, {REST, 1000U},
+  {NOTE_G3, 4000U}, {REST, 1000U}
+};
+static const Song_t DiagnosticHarmony = {
+  DiagnosticHarmonyNotes,
+  sizeof(DiagnosticHarmonyNotes) / sizeof(DiagnosticHarmonyNotes[0]),
+  0
+};
+static const Song_t DiagnosticSong = {
+  DiagnosticMelodyNotes,
+  sizeof(DiagnosticMelodyNotes) / sizeof(DiagnosticMelodyNotes[0]),
+  &DiagnosticHarmony
 };
 
 //Wave Definition
@@ -240,7 +270,21 @@ static volatile Voice_t Harmony = {
 static volatile uint32_t PlaybackSpeed = 1;
 static volatile PlaybackState_t PlaybackState = STOPPED;
 // Song_Init uses this selection too; change the default song here.
-static const Song_t *CurrentSong = &MinuetSong;
+static const Song_t *CurrentSong =
+    MUSIC_DIAGNOSTIC_MODE ? &DiagnosticSong : &MinuetSong;
+// Set outside the sample ISR when selecting a song.
+static volatile uint32_t Music_OutputGain = MUSIC_OUTPUT_GAIN;
+// CCS watch label: 1..4 during the test tones; 0 in silence or when stopped/paused.
+volatile uint32_t Music_DiagnosticStage = 0;
+static void Music_UpdateDiagnosticStage(void){
+  if(CurrentSong == &DiagnosticSong && PlaybackState == PLAYING &&
+     Melody.noteIndex < DiagnosticSong.length && (Melody.noteIndex & 1U) == 0U){
+    Music_DiagnosticStage = Melody.noteIndex / 2U + 1U;
+  }
+  else{
+    Music_DiagnosticStage = 0;
+  }
+}
 
 // Called by the 1 ms score clock (independent from pitch)
 //choose current gain
@@ -268,12 +312,15 @@ static int32_t Music_VoiceContribution(const volatile Voice_t *voice){
 // A full SPI queue indicates lost audio samples. Inspect this in CCS.
 // It is reset at Song_Init; the ISR never waits for FIFO space.
 volatile uint32_t Music_DACDroppedSamples = 0;
+// Counts samples actually queued to SPI, not measured analog output.
+volatile uint32_t Music_DACSamplesWritten = 0;
 static void Music_WriteDAC(uint32_t sample){
   if((SPI0->STAT & 0x02U) == 0U){
     Music_DACDroppedSamples++;
     return;
   }
   MCP4921_OutNonBlocking(sample);
+  Music_DACSamplesWritten++;
 }
 
 // Only the SysTick sample callback streams audio to the DAC. TimerA1
@@ -292,7 +339,7 @@ static void Music_OutputMix(void){
     }
   }
   sample = DAC_MIDPOINT +
-      ((sample - DAC_MIDPOINT) * (int32_t)MUSIC_OUTPUT_GAIN) / (int32_t)GAIN_FULL;
+      ((sample - DAC_MIDPOINT) * (int32_t)Music_OutputGain) / (int32_t)GAIN_FULL;
   // Defensive bounds also protect the DAC configuration bits.
   if(sample < 0){ sample = 0; }
   else if(sample > 4095){ sample = 4095; }
@@ -425,6 +472,7 @@ static void Music_Tick1ms(void){
     PlaybackState = STOPPED;
     Music_Silence();
   }
+  Music_UpdateDiagnosticStage();
 }
 
 void Song_Init(void){
@@ -433,6 +481,10 @@ void Song_Init(void){
   PlaybackState = STOPPED;
   PlaybackSpeed = 1;
   Music_DACDroppedSamples = 0;
+  Music_DACSamplesWritten = 0;
+  Music_DiagnosticStage = 0;
+  Music_OutputGain = (CurrentSong == &DiagnosticSong) ?
+      MUSIC_DIAGNOSTIC_GAIN : MUSIC_OUTPUT_GAIN;
   Music_InitHarmonyTimer();
   Music_ResetVoice(&Melody, CurrentSong);
   Music_ResetVoice(&Harmony, CurrentSong->harmony);
@@ -449,6 +501,7 @@ void Pause(void){
   if(PlaybackState == PLAYING){
     PlaybackState = PAUSED;
     Music_Silence();
+    Music_UpdateDiagnosticStage();
   }
   __set_PRIMASK(previousMask);
 }
@@ -459,6 +512,8 @@ void Play(const Song_t *song){
   __disable_irq();
   if(PlaybackState == STOPPED || CurrentSong != song){
     CurrentSong = song;
+    Music_OutputGain = (song == &DiagnosticSong) ?
+        MUSIC_DIAGNOSTIC_GAIN : MUSIC_OUTPUT_GAIN;
     Music_ResetVoice(&Melody, song);
     Music_ResetVoice(&Harmony, song->harmony);
     PlaybackState = PLAYING;
@@ -474,6 +529,7 @@ void Play(const Song_t *song){
       Harmony.arm(Harmony.score->notes[Harmony.noteIndex].period);
     }
   }
+  Music_UpdateDiagnosticStage();
   __set_PRIMASK(previousMask);
 }
 
@@ -484,6 +540,7 @@ void Rewind(void){
   Music_ResetVoice(&Melody, CurrentSong);
   Music_ResetVoice(&Harmony, CurrentSong->harmony);
   Music_Silence();
+  Music_UpdateDiagnosticStage();
   __set_PRIMASK(previousMask);
 }
 

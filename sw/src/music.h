@@ -44,4 +44,12 @@ void ToggleSpeed(void);
 // Inspect in the CCS watch window; reset by Song_Init().
 extern volatile uint32_t Music_DACDroppedSamples;
 
+// Number of samples queued by the audio path; reset by Song_Init().
+// A rising count shows the writer is active, but does not prove DAC output.
+extern volatile uint32_t Music_DACSamplesWritten;
+
+// Listening-test label: 1 melody, 2 harmony, 3 unison, 4 octave;
+// 0 during gaps, pause, stop, or regular song playback.
+extern volatile uint32_t Music_DiagnosticStage;
+
 #endif // MUSIC_H
