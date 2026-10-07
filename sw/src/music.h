@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 typedef struct {
-  uint32_t period;       // SysTick clock cycles per sample; 0 = rest.
+  uint32_t period;       // Legacy pitch unit: 80 MHz / (64 * period); 0 = rest.
   uint32_t duration_ms;  // How long this note or rest lasts.
 } Note_t;
 
@@ -28,7 +28,8 @@ typedef struct {
 
 //-------------- Song_Init ----------------
 // Initialize both voices, DAC, switches, TimerA1 and TimerG8 score clock.
-// Play starts SysTick (melody) and TimerA1 (harmony) for pitched notes.
+// Play starts fixed 32 kHz SysTick (melody/DAC) and TimerA1 (harmony).
+// Pitches use independent fractional waveform positions; TimerG8 is 1 ms.
 // Inputs: none
 // Outputs: none
 // called once

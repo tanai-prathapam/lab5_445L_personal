@@ -4,9 +4,9 @@
 // EE445L Fall 2026
 //    Jonathan W. Valvano 6/28/26
 
-// the 64 comes from the length of the sine wave table
-// Bus cycle runs at 80MHz
-// freq =80,000,000/64/Period = 1,250,000/Period
+// Legacy note periods encode pitch: frequency = 80 MHz / (64 * period).
+// Both waveform generators now run at a fixed 32 kHz. A fractional
+// position in the sine table sets each pitch independently of that rate.
 
 #include <stdint.h>
 #include <ti/devices/msp/msp.h>
@@ -19,7 +19,8 @@
 
 void SysTick_InitArm(void (*task)(void), uint32_t period, uint32_t priority);
 
-// SysTick reload values, in 12.5ns bus cycles per waveform sample.
+// Pitch constants in the original 12.5ns bus-cycle/sample units.
+// These are converted to phase increments, not used as timer reloads.
 // period = 1,250,000 / frequency. Every value below lands within 0.03%
 // of equal temperament with A4 = 440 Hz.
 // Bass pitches use the same 80 MHz / 64-sample period units.
@@ -55,9 +56,12 @@ void SysTick_InitArm(void (*task)(void), uint32_t period, uint32_t priority);
 #define ENVELOPE_RELEASE_MS 80U
 #define GAIN_FULL          256U
 #define DAC_MIDPOINT      2048
-// One DAC writer; its idle rate keeps harmony audible during melody rests.
-#define DAC_IDLE_PERIOD   2500U // 32 kHz at 80 MHz.
-// Bench isolation: 0 disables the default song's bass, 1 enables it.
+// Fixed waveform/DAC cadence for every note, including rests.
+#define MUSIC_SAMPLE_PERIOD 2500U // 80 MHz / 2500 = 32 kHz.
+// Q16 table position: upper bits are the index, lower 16 are fractional.
+#define PHASE_FRACTION_BITS 16U
+#define PHASE_ONE (1U << PHASE_FRACTION_BITS)
+// Listening comparison: 0 = melody alone, 1 = melody + harmony.
 #define MUSIC_ENABLE_HARMONY 1
 // 256 = current level. Try 128 to check amplifier/speaker headroom.
 #define MUSIC_OUTPUT_GAIN 256U
@@ -197,10 +201,9 @@ typedef struct {
   const Song_t *score;
   const Instrument_t *instrument;
   const Envelope_t *envelope;
-  void (*arm)(uint32_t period);
-  void (*stop)(void);
   uint32_t noteIndex;
-  uint32_t waveIndex;
+  uint32_t phase;            // Q16 position within one waveform cycle.
+  uint32_t phaseStep;        // Pitch: table positions advanced per audio tick.
   uint32_t remainingMs;
   uint32_t elapsedMs;
   uint32_t attackMs;
@@ -224,8 +227,9 @@ static const uint16_t EnvelopeCurve[33] = {
 };
 
 static void Music_OutputSample(void);
-static void Music_ArmMelody(uint32_t period){
-  SysTick_InitArm(&Music_OutputSample, period, 0);
+static void Music_ArmMelody(void){
+  // Priority 1: the priority-0 harmony update finishes before the DAC mix.
+  SysTick_InitArm(&Music_OutputSample, MUSIC_SAMPLE_PERIOD, 1);
 }
 static void Music_StopMelody(void){
   SysTick->CTRL = 0;
@@ -239,15 +243,15 @@ static void Music_StopHarmony(void){
   TIMA1->CPU_INT.ICLR = 1U; // Clear peripheral zero event.
   NVIC->ICPR[0] = 1U << 19; // Clear the corresponding pending NVIC interrupt.
 }
-static void Music_ArmHarmony(uint32_t period){
+static void Music_ArmHarmony(void){
   Music_StopHarmony();
-  TIMA1->COUNTERREGS.LOAD = period - 1U;
+  TIMA1->COUNTERREGS.LOAD = MUSIC_SAMPLE_PERIOD - 1U;
   // CTRCTL.CVAE=0 from TimerA1_IntArm reloads the counter on enable.
   TIMA1->COUNTERREGS.CTRCTL |= 1U;
 }
 static void Music_InitHarmonyTimer(void){
-  // TimerA1 clock = 80 MHz, prescale=1: same period units as SysTick.
-  // Equal priority 0 prevents the two sample/mixer routines nesting.
+  // TimerA1 clock = 80 MHz, prescale=1: same fixed rate as SysTick.
+  // Priority 0 lets the bass sample finish before priority-1 DAC output.
   TimerA1_IntArm(65535U, 1U, 0U);
   HarmonyTimerReady = 1;
   Music_StopHarmony();
@@ -256,16 +260,12 @@ static void Music_InitHarmonyTimer(void){
 static volatile Voice_t Melody = {
   .score = &MinuetSong,
   .instrument = &SineInstrument,
-  .envelope = &DefaultEnvelope,
-  .arm = Music_ArmMelody,
-  .stop = Music_StopMelody
+  .envelope = &DefaultEnvelope
 };
 static volatile Voice_t Harmony = {
   .score = &MinuetHarmony,
   .instrument = &SineInstrument,
-  .envelope = &DefaultEnvelope,
-  .arm = Music_ArmHarmony,
-  .stop = Music_StopHarmony
+  .envelope = &DefaultEnvelope
 };
 static volatile uint32_t PlaybackSpeed = 1;
 static volatile PlaybackState_t PlaybackState = STOPPED;
@@ -323,10 +323,11 @@ static void Music_WriteDAC(uint32_t sample){
   Music_DACSamplesWritten++;
 }
 
-// Only the SysTick sample callback streams audio to the DAC. TimerA1
-// publishes its latest bass sample; it does not enqueue a second DAC write.
-// This avoids two independently timed streams contending for SPI output.
-// Reserve half the amplitude per attached voice, including through rests.
+// Only SysTick streams audio to the DAC. Both waveform clocks have the
+// same fixed rate; priority-0 TimerA1 publishes bass before priority-1
+// SysTick combines it with the current melody sample. Neither clock is
+// restarted on note changes. Reserve half the amplitude per attached voice,
+// including through rests, to avoid clipping or sudden volume changes.
 static void Music_OutputMix(void){
   int32_t sample = DAC_MIDPOINT;
   if(PlaybackState == PLAYING){
@@ -346,15 +347,27 @@ static void Music_OutputMix(void){
   Music_WriteDAC((uint32_t)sample);
 }
 
-//UNCENTER - sine sample
+// Generate a sample at the voice's fractional table position. Linear
+// interpolation avoids rounding every output sample to one of 64 entries.
+// The audio ISR uses integer multiply/shifts; pitch division happens only
+// when loading a note, at the 1 ms score rate.
 static void Music_StepVoiceSample(volatile Voice_t *voice){
   if(!voice->sounding){ return; }
-  voice->latestSample =
-      (int32_t)voice->instrument->samples[voice->waveIndex] - DAC_MIDPOINT;
-  voice->waveIndex++;
-  if(voice->waveIndex >= voice->instrument->length){
-    voice->waveIndex = 0;
-  }
+  const uint16_t *wave = voice->instrument->samples;
+  uint32_t length = voice->instrument->length;
+  uint32_t phase = voice->phase;
+  uint32_t index = phase >> PHASE_FRACTION_BITS;
+  uint32_t next = index + 1U;
+  if(next == length){ next = 0; }
+  int32_t fraction = (int32_t)(phase & (PHASE_ONE - 1U));
+  int32_t first = (int32_t)wave[index];
+  int32_t delta = (int32_t)wave[next] - first;
+  voice->latestSample = first + (delta * fraction) / (int32_t)PHASE_ONE
+      - DAC_MIDPOINT;
+  phase += voice->phaseStep;
+  uint32_t cycle = length << PHASE_FRACTION_BITS;
+  if(phase >= cycle){ phase -= cycle; }
+  voice->phase = phase;
 }
 
 static void Music_OutputSample(void){
@@ -368,23 +381,23 @@ void TIMA1_IRQHandler(void){
   if(TIMA1->CPU_INT.IIDX == 1U){
     if(PlaybackState == PLAYING && Harmony.sounding){
       Music_StepVoiceSample(&Harmony);
-      // SysTick reads this sample on its next DAC update.
+      // Both clocks are 32 kHz; SysTick outputs this sample after this ISR.
     }
   }
 }
 
 // Preserve position and envelope for pause. Rewind resets them separately.
 static void Music_Silence(void){
-  Melody.stop();
-  Harmony.stop();
+  Music_StopMelody();
+  Music_StopHarmony();
   Music_WriteDAC(DAC_MIDPOINT);
 }
 
 static void Music_ResetVoice(volatile Voice_t *voice, const Song_t *score){
-  voice->stop();
   voice->score = score;
   voice->noteIndex = 0;
-  voice->waveIndex = 0;
+  voice->phase = 0;
+  voice->phaseStep = 0;
   voice->remainingMs = 0;
   voice->elapsedMs = 0;
   voice->attackMs = 0;
@@ -395,19 +408,30 @@ static void Music_ResetVoice(volatile Voice_t *voice, const Song_t *score){
 }
 
 static void Music_LoadVoiceNote(volatile Voice_t *voice){
+  const Note_t *note = 0;
+  uint32_t phaseStep = 0;
+  if(voice->score != 0 && voice->noteIndex < voice->score->length){
+    note = &voice->score->notes[voice->noteIndex];
+    if(note->period != REST && note->duration_ms != 0){
+      // Increment = sample-clock period / legacy note period, in Q16.
+      // All supported pitches are far below the 16 kHz Nyquist limit.
+      phaseStep = ((MUSIC_SAMPLE_PERIOD << PHASE_FRACTION_BITS) +
+          note->period / 2U) / note->period;
+    }
+  }
   uint32_t previousMask = __get_PRIMASK();
   __disable_irq();
-  voice->stop();
-  voice->waveIndex = 0;
+  voice->phase = 0;
+  voice->phaseStep = 0;
   voice->elapsedMs = 0;
   voice->remainingMs = 0;
   voice->latestSample = 0;
   voice->gain = 0;
   voice->sounding = 0;
 
-  if(voice->score != 0 && voice->noteIndex < voice->score->length){
-    const Note_t *note = &voice->score->notes[voice->noteIndex];
+  if(note != 0){
     voice->remainingMs = note->duration_ms;
+    voice->phaseStep = phaseStep;
     voice->sounding = (note->period != REST && note->duration_ms != 0);
 
     //set original range
@@ -421,14 +445,9 @@ static void Music_LoadVoiceNote(volatile Voice_t *voice){
       voice->releaseMs = note->duration_ms - voice->attackMs;
     }
     Music_UpdateEnvelope(voice);
-    if(voice->sounding){ voice->arm(note->period); }
   }
-  // SysTick owns DAC output even when the melody is resting or finished.
-  // Without this fallback, the bass would stop reaching the DAC too.
-  if(voice == &Melody && !voice->sounding){
-    Music_ArmMelody(DAC_IDLE_PERIOD);
-  }
-  // SysTick publishes the updated mix; score changes do not enqueue audio.
+  // Publish only voice state. Both sample timers keep their fixed cadence
+  // through note changes, rests and an early end of either score.
   __set_PRIMASK(previousMask);
 }
 
@@ -514,20 +533,22 @@ void Play(const Song_t *song){
     CurrentSong = song;
     Music_OutputGain = (song == &DiagnosticSong) ?
         MUSIC_DIAGNOSTIC_GAIN : MUSIC_OUTPUT_GAIN;
+    Music_StopMelody();
+    Music_StopHarmony();
     Music_ResetVoice(&Melody, song);
     Music_ResetVoice(&Harmony, song->harmony);
     PlaybackState = PLAYING;
     Music_LoadVoiceNote(&Melody);
     Music_LoadVoiceNote(&Harmony);
+    // Start bass first, then melody/DAC with the same period. This order,
+    // plus the higher bass priority, gives one new bass sample per mix.
+    if(Harmony.score != 0){ Music_ArmHarmony(); }
+    Music_ArmMelody();
   }
   else if(PlaybackState == PAUSED){
     PlaybackState = PLAYING;
-    uint32_t period = Melody.sounding ?
-        Melody.score->notes[Melody.noteIndex].period : DAC_IDLE_PERIOD;
-    Melody.arm(period);
-    if(Harmony.sounding){
-      Harmony.arm(Harmony.score->notes[Harmony.noteIndex].period);
-    }
+    if(Harmony.score != 0){ Music_ArmHarmony(); }
+    Music_ArmMelody();
   }
   Music_UpdateDiagnosticStage();
   __set_PRIMASK(previousMask);

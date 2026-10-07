@@ -44,7 +44,7 @@ void SysTick_InitArm(void(*task)(void), uint32_t period, uint32_t priority){
   SysTick->CTRL = 0x00;      // disable SysTick during setup
   PeriodicTask = task; 
   SysTick->LOAD = period-1;  // reload value
-  SCB->SHP[1] = (SCB->SHP[1]&(~0xC0000000))|(priority<<30); // priority 2
+  SCB->SHP[1] = (SCB->SHP[1]&(~0xC0000000))|(priority<<30); // supplied priority
   SysTick->VAL = 0;          // any write to VAL clears COUNT and sets VAL equal to LOAD
   SysTick->CTRL = 0x07;      // enable SysTick with 80 MHz bus clock and interrupts
 }
