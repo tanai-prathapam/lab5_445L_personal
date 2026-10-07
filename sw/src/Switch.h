@@ -5,6 +5,9 @@
 //    Jonathan W. Valvano 6/29/26
 // 2-bit input, positive logic switches, positive logic software
 
+#ifndef SWITCH_H
+#define SWITCH_H
+
 #include <stdint.h>
 
     // write this
@@ -44,4 +47,8 @@ typedef enum {
 } Button_t;
 
 uint32_t Get_Button_Press(Button_t button);
+// Duration of the last completed debounced press (call after release event).
+uint32_t Get_Button_HoldMs(Button_t button);
+
+#endif // SWITCH_H
 

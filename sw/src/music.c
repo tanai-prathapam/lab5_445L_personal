@@ -61,8 +61,15 @@ void SysTick_InitArm(void (*task)(void), uint32_t period, uint32_t priority);
 // Q16 table position: upper bits are the index, lower 16 are fractional.
 #define PHASE_FRACTION_BITS 16U
 #define PHASE_ONE (1U << PHASE_FRACTION_BITS)
-// Listening comparison: 0 = melody alone, 1 = melody + harmony.
+// Startup choice: 0 = harmony muted, 1 = harmony audible.
+// Hold Speed for at least 800 ms, then release, to toggle while playing.
 #define MUSIC_ENABLE_HARMONY 1
+// 1 = simpler octave below melody; 0 = the original score's bass line.
+#define MUSIC_HARMONY_STYLE 1
+// Bass level relative to melody: 128 = half; 64 = quarter; 256 = equal.
+#define MUSIC_HARMONY_GAIN 128U
+#define HARMONY_HOLD_MS 800U
+#define HARMONY_TOGGLE_FADE_MS 40U
 // 256 = current level. Try 128 to check amplifier/speaker headroom.
 #define MUSIC_OUTPUT_GAIN 256U
 // Temporary listening test: 1 selects four isolated tones; 0 restores Minuet.
@@ -142,10 +149,17 @@ static const Song_t MinuetHarmony = {
   sizeof(MinuetHarmonyNotes) / sizeof(MinuetHarmonyNotes[0]),
   0 // No further voice attached to this bass track.
 };
+// Reuse the melody's timing. Music_LoadVoiceNote doubles its pitch period
+// for this score, producing an octave below without duplicating the array.
+static const Song_t MinuetOctaveHarmony = {
+  MinuetNotes,
+  sizeof(MinuetNotes) / sizeof(MinuetNotes[0]),
+  0
+};
 static const Song_t MinuetSong = {
   MinuetNotes,
   sizeof(MinuetNotes) / sizeof(MinuetNotes[0]),
-  MUSIC_ENABLE_HARMONY ? &MinuetHarmony : 0
+  MUSIC_HARMONY_STYLE ? &MinuetOctaveHarmony : &MinuetHarmony
 };
 
 // Four 4-second tones, each followed by 1 second of silence:
@@ -274,6 +288,33 @@ static const Song_t *CurrentSong =
     MUSIC_DIAGNOSTIC_MODE ? &DiagnosticSong : &MinuetSong;
 // Set outside the sample ISR when selecting a song.
 static volatile uint32_t Music_OutputGain = MUSIC_OUTPUT_GAIN;
+// Mute only the contribution, keeping the harmony score/clock in time.
+// This choice survives pause, rewind and replay; Song_Init resets it.
+volatile uint32_t Music_HarmonyEnabled = MUSIC_ENABLE_HARMONY;
+static uint32_t HarmonyFadePosition = HARMONY_TOGGLE_FADE_MS;
+static uint32_t Music_HarmonyLevel = MUSIC_HARMONY_GAIN;
+static volatile uint32_t Music_HarmonyMixGain = MUSIC_HARMONY_GAIN;
+
+static void Music_UpdateHarmonyMixGain(void){
+  Music_HarmonyMixGain =
+      (Music_HarmonyLevel * HarmonyFadePosition) / HARMONY_TOGGLE_FADE_MS;
+}
+static void Music_SelectOutputLevels(void){
+  Music_OutputGain = (CurrentSong == &DiagnosticSong) ?
+      MUSIC_DIAGNOSTIC_GAIN : MUSIC_OUTPUT_GAIN;
+  // Keep the diagnostic melody/harmony comparison at equal levels.
+  Music_HarmonyLevel = (CurrentSong == &DiagnosticSong) ?
+      GAIN_FULL : MUSIC_HARMONY_GAIN;
+  Music_UpdateHarmonyMixGain();
+}
+static void Music_TickHarmonyFade(void){
+  uint32_t target = Music_HarmonyEnabled ? HARMONY_TOGGLE_FADE_MS : 0U;
+  if(HarmonyFadePosition < target){ HarmonyFadePosition++; }
+  else if(HarmonyFadePosition > target){ HarmonyFadePosition--; }
+  else{ return; }
+  // Fade in real milliseconds, even at 2x tempo or while paused.
+  Music_UpdateHarmonyMixGain();
+}
 // CCS watch label: 1..4 during the test tones; 0 in silence or when stopped/paused.
 volatile uint32_t Music_DiagnosticStage = 0;
 static void Music_UpdateDiagnosticStage(void){
@@ -333,7 +374,9 @@ static void Music_OutputMix(void){
   if(PlaybackState == PLAYING){
     int32_t melody = Music_VoiceContribution(&Melody);
     if(Harmony.score != 0){
-      sample += (melody + Music_VoiceContribution(&Harmony)) / 2;
+      int32_t harmony = (Music_VoiceContribution(&Harmony) *
+          (int32_t)Music_HarmonyMixGain) / (int32_t)GAIN_FULL;
+      sample += (melody + harmony) / 2;
     }
     else{
       sample += melody; // A song without harmony retains full amplitude.
@@ -413,10 +456,12 @@ static void Music_LoadVoiceNote(volatile Voice_t *voice){
   if(voice->score != 0 && voice->noteIndex < voice->score->length){
     note = &voice->score->notes[voice->noteIndex];
     if(note->period != REST && note->duration_ms != 0){
+      uint32_t period = note->period;
+      if(voice->score == &MinuetOctaveHarmony){ period *= 2U; }
       // Increment = sample-clock period / legacy note period, in Q16.
       // All supported pitches are far below the 16 kHz Nyquist limit.
       phaseStep = ((MUSIC_SAMPLE_PERIOD << PHASE_FRACTION_BITS) +
-          note->period / 2U) / note->period;
+          period / 2U) / period;
     }
   }
   uint32_t previousMask = __get_PRIMASK();
@@ -476,11 +521,15 @@ static void Music_CheckButtons(void){
     if(PlaybackState == PLAYING){ Pause(); }
     else{ Play(CurrentSong); }
   }
-  if(speed){ ToggleSpeed(); }
+  if(speed){
+    if(Get_Button_HoldMs(BUTTON_SPEED) >= HARMONY_HOLD_MS){ ToggleHarmony(); }
+    else{ ToggleSpeed(); }
+  }
 }
 
 static void Music_Tick1ms(void){
   Music_CheckButtons();
+  Music_TickHarmonyFade();
   if(PlaybackState != PLAYING){ return; }
   // Waveform interrupts may preempt envelope calculations. They read only
   // the published gain and sample, not the in-progress note bookkeeping.
@@ -502,8 +551,11 @@ void Song_Init(void){
   Music_DACDroppedSamples = 0;
   Music_DACSamplesWritten = 0;
   Music_DiagnosticStage = 0;
-  Music_OutputGain = (CurrentSong == &DiagnosticSong) ?
-      MUSIC_DIAGNOSTIC_GAIN : MUSIC_OUTPUT_GAIN;
+  // Diagnostics start with both paths audible, regardless of song default.
+  Music_HarmonyEnabled = (CurrentSong == &DiagnosticSong) ?
+      1U : MUSIC_ENABLE_HARMONY;
+  HarmonyFadePosition = Music_HarmonyEnabled ? HARMONY_TOGGLE_FADE_MS : 0U;
+  Music_SelectOutputLevels();
   Music_InitHarmonyTimer();
   Music_ResetVoice(&Melody, CurrentSong);
   Music_ResetVoice(&Harmony, CurrentSong->harmony);
@@ -531,8 +583,7 @@ void Play(const Song_t *song){
   __disable_irq();
   if(PlaybackState == STOPPED || CurrentSong != song){
     CurrentSong = song;
-    Music_OutputGain = (song == &DiagnosticSong) ?
-        MUSIC_DIAGNOSTIC_GAIN : MUSIC_OUTPUT_GAIN;
+    Music_SelectOutputLevels();
     Music_StopMelody();
     Music_StopHarmony();
     Music_ResetVoice(&Melody, song);
@@ -569,5 +620,13 @@ void ToggleSpeed(void){
   uint32_t previousMask = __get_PRIMASK();
   __disable_irq();
   PlaybackSpeed = (PlaybackSpeed == 1) ? 2 : 1;
+  __set_PRIMASK(previousMask);
+}
+
+void ToggleHarmony(void){
+  uint32_t previousMask = __get_PRIMASK();
+  __disable_irq();
+  Music_HarmonyEnabled = !Music_HarmonyEnabled;
+  // TimerG8 ramps the mixer gain over 40 ms; neither score is restarted.
   __set_PRIMASK(previousMask);
 }

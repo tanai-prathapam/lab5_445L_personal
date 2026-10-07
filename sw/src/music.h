@@ -40,6 +40,10 @@ void Play(const Song_t *song);
 void Pause(void);
 void Rewind(void);
 void ToggleSpeed(void);
+// Hold/release Speed to toggle harmony with a smooth 40 ms mixer fade.
+void ToggleHarmony(void);
+// CCS watch: 1 = harmony requested, 0 = muted; preserved through rewind.
+extern volatile uint32_t Music_HarmonyEnabled;
 
 // Nonzero means the SPI transmit FIFO was full when an audio write was due.
 // Inspect in the CCS watch window; reset by Song_Init().

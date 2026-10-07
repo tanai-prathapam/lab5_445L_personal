@@ -18,6 +18,15 @@
 #define PLAY_MASK  (1U << 27)
 #define VOICE_MASK (1U << 28)
 #define REWIND_MASK (1U << 6)
+
+typedef struct {
+  uint32_t stablePressed;
+  uint32_t changeCount;
+  uint32_t heldMs;
+  uint32_t lastHoldMs;
+} ButtonState_t;
+
+static ButtonState_t ButtonStates[BUTTON_COUNT] = {0};
  
 
 //---------------------Switch_Init---------------------
@@ -34,6 +43,9 @@ void Switch_Init(void){
    GPIOA->DOE31_0 &= ~(1 << 27);  
    GPIOA->DOE31_0 &= ~(1 << 28);
    GPIOB->DOE31_0 &= ~(1 << 6);
+   for(uint32_t button = 0; button < BUTTON_COUNT; button++){
+     ButtonStates[button] = (ButtonState_t){0};
+   }
 }
 
 //---------------------Switch_Play---------------------
@@ -58,13 +70,6 @@ int Switch_Rewind(void) {
    return (GPIOB->DIN31_0 & REWIND_MASK) != 0;
 }
 
-typedef struct {
-  uint32_t stablePressed;
-  uint32_t changeCount;
-} ButtonState_t;
-
-static ButtonState_t ButtonStates[BUTTON_COUNT] = {0};
-
 static uint32_t ReadButton(Button_t button){
   switch(button){
     case BUTTON_PLAY:
@@ -84,8 +89,12 @@ static uint32_t ReadButton(Button_t button){
 // Call once per millisecond for each button using TimerG8
 // Returns 1 once after a stable press followed by a stable release.
 uint32_t Get_Button_Press(Button_t button){
+  if(button >= BUTTON_COUNT){ return 0; }
   ButtonState_t *state = &ButtonStates[button];
   uint32_t cur_state = ReadButton(button);
+  if(state->stablePressed && state->heldMs < UINT32_MAX){
+    state->heldMs++;
+  }
 
   if(cur_state == state->stablePressed){ //still on same state
     state->changeCount = 0;
@@ -100,11 +109,19 @@ uint32_t Get_Button_Press(Button_t button){
       state->changeCount = 0;
 
       if(cur_state == 0){ //a press and release has been detected
+        state->lastHoldMs = state->heldMs;
+        state->heldMs = 0;
         return 1;
       }
+      state->heldMs = 0;
     }
   }
 
   return 0;
+}
+
+uint32_t Get_Button_HoldMs(Button_t button){
+  if(button >= BUTTON_COUNT){ return 0; }
+  return ButtonStates[button].lastHoldMs;
 }
 
